@@ -498,6 +498,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Download-Options"] = "noopen"
         # Security: prevent search engines from indexing API responses
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        # Security: cross-origin isolation headers to prevent Spectre-style attacks
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         return response
 
 
