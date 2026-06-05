@@ -165,12 +165,11 @@ def _redact_text_watermarks(doc: fitz.Document, opt: ProcessOptions) -> int:
 
 
 def _red_mask_rgb(roi_rgb: np.ndarray, opt: ProcessOptions) -> np.ndarray:
-    r = roi_rgb[:, :, 0].astype(np.int16)
-    g = roi_rgb[:, :, 1].astype(np.int16)
-    b = roi_rgb[:, :, 2].astype(np.int16)
-    hsv = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV)
-    sat = hsv[:, :, 1].astype(np.int16)
-    val = hsv[:, :, 2].astype(np.int16)
+    # Optimization: batch channel conversion to int16 (2 allocations instead of 5)
+    rgb_i16 = roi_rgb.astype(np.int16)
+    r, g, b = rgb_i16[:, :, 0], rgb_i16[:, :, 1], rgb_i16[:, :, 2]
+    hsv_i16 = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2HSV).astype(np.int16)
+    sat, val = hsv_i16[:, :, 1], hsv_i16[:, :, 2]
     mask = (
         (r - g >= opt.min_red_over_green)
         & (r - b >= opt.min_red_over_blue)
@@ -308,6 +307,51 @@ def _encode_png(img_rgb: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
+def _redact_text_watermarks_page(doc: fitz.Document, opt: ProcessOptions, page_no: int) -> int:
+    """Remove text watermarks on a single page only (preview optimization)."""
+    if not opt.remove_text_watermark or not opt.text_rules:
+        return 0
+    if page_no < 1 or page_no > doc.page_count:
+        return 0
+
+    page = doc[page_no - 1]
+    page_w, page_h = page.rect.width, page.rect.height
+    words = page.get_text("words")
+    hit_count = 0
+
+    for rule in opt.text_rules:
+        if not _rule_applies_to_page(rule, page_no):
+            continue
+        safe_rect = None
+        if rule.rect is not None:
+            x0, y0, x1, y1 = rule.rect.to_pixels(int(page_w), int(page_h))
+            safe_rect = fitz.Rect(x0, y0, x1, y1)
+
+        if rule.mode in ("exact", "contains", "regex"):
+            for w in words:
+                text = w[4]
+                r = fitz.Rect(w[0], w[1], w[2], w[3])
+                if safe_rect is not None and not r.intersects(safe_rect):
+                    continue
+                if _match_text(text, rule):
+                    page.add_redact_annot(r + (-1, -1, 1, 1), fill=(1, 1, 1))
+                    hit_count += 1
+
+        if " " in rule.text or len(rule.text) >= 4:
+            flags = 0
+            if rule.mode != "regex":
+                for inst in page.search_for(rule.text, flags=flags):
+                    if safe_rect is not None and not inst.intersects(safe_rect):
+                        continue
+                    page.add_redact_annot(inst + (-1, -1, 1, 1), fill=(1, 1, 1))
+                    hit_count += 1
+
+    if hit_count > 0:
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+    return hit_count
+
+
 def _open_pdf_with_text_redaction(input_pdf: Path, opt: ProcessOptions) -> tuple[fitz.Document, int]:
     doc = fitz.open(input_pdf)
     redactions = _redact_text_watermarks(doc, opt)
@@ -421,9 +465,12 @@ def process_pdf(input_pdf: Path, output_pdf: Path, opt: ProcessOptions) -> dict[
 
 
 def preview_png(input_pdf: Path, opt: ProcessOptions, page_no: int) -> bytes:
-    doc, _ = _open_pdf_with_text_redaction(input_pdf, opt)
+    doc = fitz.open(input_pdf)
     if page_no < 1 or page_no > doc.page_count:
+        doc.close()
         raise ValueError(f"Invalid preview page {page_no}; PDF has {doc.page_count} pages.")
+    # Optimization: only redact text on the requested page, not all pages
+    _redact_text_watermarks_page(doc, opt, page_no)
     page = doc[page_no - 1]
     img_rgb = _render_page_to_rgb(page, opt.preview_dpi)
     img_rgb = _process_page_image(img_rgb, opt)
