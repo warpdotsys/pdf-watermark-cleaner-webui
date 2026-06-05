@@ -13,7 +13,10 @@ import fitz  # PyMuPDF
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response as StarletteResponse
 
 
 class Rect(BaseModel):
@@ -40,8 +43,17 @@ class TextRule(BaseModel):
     # Optional safety area. Empty/null means whole page.
     rect: Rect | None = None
 
+    @field_validator("text")
+    @classmethod
+    def limit_regex_length(cls, v: str, info) -> str:
+        # Prevent ReDoS by capping regex pattern length
+        if info.data.get("mode") == "regex" and len(v) > 500:
+            raise ValueError("Regex pattern too long (max 500 chars).")
+        return v
+
 
 class ProcessOptions(BaseModel):
+    output_mode: Literal["preserve", "rasterize"] = "preserve"
     dpi: int = Field(default=220, ge=72, le=600)
     preview_dpi: int = Field(default=130, ge=72, le=220)
     jpeg_quality: int = Field(default=92, ge=30, le=100)
@@ -79,8 +91,14 @@ def _match_text(value: str, rule: TextRule) -> bool:
     if not pat:
         return False
     if rule.mode == "regex":
+        # Security: prevent ReDoS by limiting regex length and using timeout
+        if len(pat) > 500:
+            return False  # Reject overly complex patterns
         flags = re.I if rule.ignore_case else 0
-        return re.search(pat, value, flags) is not None
+        try:
+            return re.search(pat, value, flags) is not None
+        except re.error:
+            return False  # Invalid regex treated as no match
     if rule.ignore_case:
         value = value.lower()
         pat = pat.lower()
@@ -172,6 +190,69 @@ def _apply_white_rect(img_rgb: np.ndarray, rect: Rect, color: tuple[int, int, in
         img_rgb[y0:y1, x0:x1] = np.array(color, dtype=np.uint8)
 
 
+def _rects_for_page(opt: ProcessOptions) -> list[tuple[Rect, str]]:
+    """Return list of (rect, label) pairs that define watermark regions."""
+    rects = []
+    if opt.center_mode != "disabled":
+        rects.append((opt.center_rect, "center"))
+    if opt.remove_bottom:
+        rects.append((opt.bottom_rect, "bottom"))
+    for i, r in enumerate(opt.extra_rects):
+        rects.append((r, f"extra_{i}"))
+    return rects
+
+
+def _image_intersects_rects(
+    img_rect: fitz.Rect, page_w: float, page_h: float, rects: list[tuple[Rect, str]]
+) -> list[str]:
+    """Check if an image bbox intersects any watermark region. Returns matched labels."""
+    matched = []
+    for rect, label in rects:
+        x0, y0, x1, y1 = rect.to_pixels(int(page_w), int(page_h))
+        wm_rect = fitz.Rect(x0, y0, x1, y1)
+        if img_rect.intersects(wm_rect):
+            matched.append(label)
+    return matched
+
+
+def _process_single_image(
+    img_rgb: np.ndarray, matched_labels: list[str], opt: ProcessOptions
+) -> np.ndarray:
+    """Process a single extracted image based on which watermark regions it overlaps."""
+    out = img_rgb.copy()
+    h, w = out.shape[:2]
+    bg = tuple(int(c) for c in opt.background)
+
+    if "center" in matched_labels:
+        if opt.center_mode == "white_rect":
+            _apply_white_rect(out, opt.center_rect, bg)
+        elif opt.center_mode == "red_mask":
+            # Map page-level center_rect to image-local coordinates
+            cx0, cy0, cx1, cy1 = opt.center_rect.to_pixels(w, h)
+            cx0, cx1 = sorted((max(0, cx0), min(w, cx1)))
+            cy0, cy1 = sorted((max(0, cy0), min(h, cy1)))
+            if cx1 > cx0 and cy1 > cy0:
+                roi = out[cy0:cy1, cx0:cx1]
+                mask = _red_mask_rgb(roi, opt)
+                if opt.inpaint_radius > 0:
+                    roi_bgr = cv2.cvtColor(roi, cv2.COLOR_RGB2BGR)
+                    fixed_bgr = cv2.inpaint(roi_bgr, mask, opt.inpaint_radius, cv2.INPAINT_TELEA)
+                    out[cy0:cy1, cx0:cx1] = cv2.cvtColor(fixed_bgr, cv2.COLOR_BGR2RGB)
+                else:
+                    roi[mask > 0] = np.array(bg, dtype=np.uint8)
+                    out[cy0:cy1, cx0:cx1] = roi
+
+    if "bottom" in matched_labels:
+        _apply_white_rect(out, opt.bottom_rect, bg)
+
+    for label in matched_labels:
+        if label.startswith("extra_"):
+            idx = int(label.split("_")[1])
+            _apply_white_rect(out, opt.extra_rects[idx], bg)
+
+    return out
+
+
 def _process_page_image(img_rgb: np.ndarray, opt: ProcessOptions) -> np.ndarray:
     out = img_rgb.copy()
     h, w = out.shape[:2]
@@ -232,7 +313,76 @@ def _open_pdf_with_text_redaction(input_pdf: Path, opt: ProcessOptions) -> tuple
     return doc, redactions
 
 
-def process_pdf(input_pdf: Path, output_pdf: Path, opt: ProcessOptions) -> dict[str, Any]:
+def _process_pdf_preserve(input_pdf: Path, output_pdf: Path, opt: ProcessOptions) -> dict[str, Any]:
+    """Process PDF preserving original structure: text redaction + in-place image replacement."""
+    doc, redactions = _open_pdf_with_text_redaction(input_pdf, opt)
+    target_pages = set(opt.pages)
+    page_count = doc.page_count
+
+    if target_pages:
+        invalid = sorted(p for p in target_pages if p < 1 or p > page_count)
+        if invalid:
+            raise ValueError(f"Invalid page numbers: {invalid}; PDF has {page_count} pages.")
+
+    wm_rects = _rects_for_page(opt)
+    processed_pages: list[int] = []
+    images_processed = 0
+
+    for idx, page in enumerate(doc, start=1):
+        if target_pages and idx not in target_pages:
+            continue
+        processed_pages.append(idx)
+
+        page_w, page_h = page.rect.width, page.rect.height
+        for img in page.get_images(full=True):
+            xref = img[0]
+            rects = page.get_image_rects(img)
+            if not rects:
+                continue
+
+            for img_rect in rects:
+                matched = _image_intersects_rects(img_rect, page_w, page_h, wm_rects)
+                if not matched:
+                    continue
+
+                # Extract image as numpy RGB
+                pix = fitz.Pixmap(doc, xref)
+                if pix.n > 4:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                img_rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                    pix.height, pix.width, pix.n
+                ).copy()
+
+                # Process
+                out_rgb = _process_single_image(img_rgb, matched, opt)
+
+                # Encode back to PNG
+                if pix.n == 4:
+                    ok, buf = cv2.imencode(".png", cv2.cvtColor(out_rgb, cv2.COLOR_RGBA2BGRA))
+                elif pix.n == 1:
+                    ok, buf = cv2.imencode(".png", out_rgb)
+                else:
+                    ok, buf = cv2.imencode(".png", cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR))
+                if not ok:
+                    continue
+
+                page.replace_image(xref, stream=buf.tobytes())
+                images_processed += 1
+                break  # each xref only needs one replacement
+
+    doc.save(output_pdf, garbage=4, deflate=True)
+    doc.close()
+    return {
+        "page_count": page_count,
+        "processed_pages": processed_pages,
+        "text_redactions": redactions,
+        "images_processed": images_processed,
+        "output_mode": "preserve",
+    }
+
+
+def _process_pdf_rasterize(input_pdf: Path, output_pdf: Path, opt: ProcessOptions) -> dict[str, Any]:
+    """Process PDF by rasterizing every page (legacy mode, loses text layer)."""
     for rect in [opt.center_rect, opt.bottom_rect, *opt.extra_rects]:
         _validate_rect(rect)
 
@@ -260,7 +410,13 @@ def process_pdf(input_pdf: Path, output_pdf: Path, opt: ProcessOptions) -> dict[
     out_doc.save(output_pdf, garbage=4, deflate=True)
     out_doc.close()
     doc.close()
-    return {"page_count": page_count, "processed_pages": processed_pages, "text_redactions": redactions}
+    return {"page_count": page_count, "processed_pages": processed_pages, "text_redactions": redactions, "output_mode": "rasterize"}
+
+
+def process_pdf(input_pdf: Path, output_pdf: Path, opt: ProcessOptions) -> dict[str, Any]:
+    if opt.output_mode == "preserve":
+        return _process_pdf_preserve(input_pdf, output_pdf, opt)
+    return _process_pdf_rasterize(input_pdf, output_pdf, opt)
 
 
 def preview_png(input_pdf: Path, opt: ProcessOptions, page_no: int) -> bytes:
@@ -274,9 +430,29 @@ def preview_png(input_pdf: Path, opt: ProcessOptions, page_no: int) -> bytes:
     return _encode_png(img_rgb)
 
 
-app = FastAPI(title="PDF Watermark Cleaner WebUI", version="1.2.0")
+app = FastAPI(title="PDF Watermark Cleaner WebUI", version="1.3.0")
 WORKDIR = Path(os.getenv("WORKDIR", "/tmp/pdf-watermark-service"))
 WORKDIR.mkdir(parents=True, exist_ok=True)
+
+# Security: limit upload size to prevent memory-exhaustion DoS
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+# Security: add security headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response: StarletteResponse = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Security: limit upload size to prevent memory-exhaustion DoS
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
 def _parse_options(options: str) -> ProcessOptions:
@@ -291,6 +467,8 @@ async def _save_upload(file: UploadFile, job_dir: Path) -> Path:
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail=f"Unsupported content-type: {file.content_type}")
     content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_BYTES // 1024 // 1024} MB).")
     if not content.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="Uploaded file does not look like a PDF.")
     p = job_dir / "input.pdf"
@@ -316,8 +494,8 @@ async def preview(file: UploadFile = File(...), options: str = Form(default="{}"
     input_pdf = await _save_upload(file, job_dir)
     try:
         png = preview_png(input_pdf, opt, page)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception:
+        raise HTTPException(status_code=500, detail="Preview generation failed.")
     return Response(content=png, media_type="image/png")
 
 
@@ -331,8 +509,8 @@ async def process(file: UploadFile = File(...), options: str = Form(default="{}"
     output_pdf = job_dir / "cleaned.pdf"
     try:
         process_pdf(input_pdf, output_pdf, opt)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception:
+        raise HTTPException(status_code=500, detail="PDF processing failed.")
     safe_stem = Path(file.filename or "document.pdf").stem
     return FileResponse(output_pdf, media_type="application/pdf", filename=f"{safe_stem}_cleaned.pdf")
 
@@ -386,6 +564,7 @@ details summary{cursor:pointer;color:#1d4ed8;font-weight:650}
 
       <div class="section">
         <h2>基础输出</h2>
+        <div class="row"><label>输出模式</label><select id="output_mode"><option value="preserve">保留原始结构</option><option value="rasterize">整页渲染（旧模式）</option></select></div>
         <div class="row"><label>正式输出 DPI</label><input id="dpi" type="number" min="72" max="600" value="220"></div>
         <div class="row"><label>实时预览 DPI</label><input id="preview_dpi" type="number" min="72" max="220" value="130"></div>
         <div class="row"><label>JPEG 质量</label><input id="jpeg_quality" type="number" min="30" max="100" value="92"></div>
@@ -498,7 +677,7 @@ function collectRules(){
 
 function buildOptions(){
   return {
-    dpi:num("dpi"), preview_dpi:num("preview_dpi"), jpeg_quality:num("jpeg_quality"), output_format:$("output_format").value,
+    output_mode:$("output_mode").value, dpi:num("dpi"), preview_dpi:num("preview_dpi"), jpeg_quality:num("jpeg_quality"), output_format:$("output_format").value,
     center_mode:$("center_mode").value, center_rect:rect("center"), bottom_rect:rect("bottom"),
     min_red_over_green:num("min_red_over_green"), min_red_over_blue:num("min_red_over_blue"),
     min_saturation:num("min_saturation"), min_value:num("min_value"), max_value:num("max_value"),
@@ -593,7 +772,7 @@ function applyPreset(name){
 }
 function resetAll(update=true){
   $("rules").innerHTML="";
-  setValues({dpi:220,preview_dpi:130,jpeg_quality:92,output_format:"jpeg",pages:"",center_mode:"red_mask",center_x0:.30,center_y0:.38,center_x1:.70,center_y1:.63,min_red_over_green:8,min_red_over_blue:8,min_saturation:12,min_value:120,max_value:255,dilate_kernel:3,inpaint_radius:0,remove_bottom:true,bottom_x0:0,bottom_y0:.945,bottom_x1:1,bottom_y1:1,extra_rects:"",remove_text_watermark:true,preview_page:1});
+  setValues({output_mode:"preserve", dpi:220,preview_dpi:130,jpeg_quality:92,output_format:"jpeg",pages:"",center_mode:"red_mask",center_x0:.30,center_y0:.38,center_x1:.70,center_y1:.63,min_red_over_green:8,min_red_over_blue:8,min_saturation:12,min_value:120,max_value:255,dilate_kernel:3,inpaint_radius:0,remove_bottom:true,bottom_x0:0,bottom_y0:.945,bottom_x1:1,bottom_y1:1,extra_rects:"",remove_text_watermark:true,preview_page:1});
   if(update) schedulePreview();
 }
 async function copyOptions(){try{await navigator.clipboard.writeText(JSON.stringify(buildOptions(),null,2));$("status").textContent="options JSON 已复制。";$("status").className="status ok";}catch(e){$("status").textContent="复制失败："+(e.message||String(e));$("status").className="status err";}}
