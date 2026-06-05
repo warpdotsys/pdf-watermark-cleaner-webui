@@ -506,6 +506,19 @@ def _parse_options(options: str) -> ProcessOptions:
         raise HTTPException(status_code=400, detail="Invalid options JSON.")
 
 
+def _sanitize_filename(filename: str) -> str:
+    """Sanitize filename for safe use in Content-Disposition header."""
+    # Remove path separators and null bytes
+    name = filename.replace("/", "_").replace("\\", "_").replace("\0", "")
+    # Remove leading dots (hidden files)
+    name = name.lstrip(".")
+    # Limit length
+    if len(name) > 200:
+        name = name[:200]
+    # Fallback if empty
+    return name or "document"
+
+
 async def _save_upload(file: UploadFile, job_dir: Path) -> Path:
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail=f"Unsupported content-type: {file.content_type}")
@@ -556,7 +569,8 @@ async def process(background_tasks: BackgroundTasks, file: UploadFile = File(...
         process_pdf(input_pdf, output_pdf, opt)
     except Exception:
         raise HTTPException(status_code=500, detail="PDF processing failed.")
-    safe_stem = Path(file.filename or "document.pdf").stem
+    # Security: sanitize filename to prevent header injection
+    safe_stem = _sanitize_filename(Path(file.filename or "document.pdf").stem)
     # Security: clean up temp files after response is sent
     background_tasks.add_task(shutil.rmtree, job_dir, True)
     return FileResponse(output_pdf, media_type="application/pdf", filename=f"{safe_stem}_cleaned.pdf")
