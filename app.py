@@ -505,6 +505,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Security: prevent caching of API responses containing user data
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
+        # Security: disable DNS prefetch to prevent information leakage
+        response.headers["X-DNS-Prefetch-Control"] = "off"
         return response
 
 
