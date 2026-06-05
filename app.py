@@ -494,6 +494,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
         # Security: restrict Flash/PDF cross-domain policies
         response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+        # Security: prevent IE from executing downloads in site context
+        response.headers["X-Download-Options"] = "noopen"
         return response
 
 
