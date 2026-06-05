@@ -8,10 +8,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
+import shutil
+
 import cv2
 import fitz  # PyMuPDF
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -494,11 +496,13 @@ async def preview(file: UploadFile = File(...), options: str = Form(default="{}"
         png = preview_png(input_pdf, opt, page)
     except Exception:
         raise HTTPException(status_code=500, detail="Preview generation failed.")
+    # Security: clean up temp files after response
+    shutil.rmtree(job_dir, ignore_errors=True)
     return Response(content=png, media_type="image/png")
 
 
 @app.post("/process")
-async def process(file: UploadFile = File(...), options: str = Form(default="{}")):
+async def process(background_tasks: BackgroundTasks, file: UploadFile = File(...), options: str = Form(default="{}")):
     opt = _parse_options(options)
     job_id = uuid.uuid4().hex
     job_dir = WORKDIR / job_id
@@ -510,6 +514,8 @@ async def process(file: UploadFile = File(...), options: str = Form(default="{}"
     except Exception:
         raise HTTPException(status_code=500, detail="PDF processing failed.")
     safe_stem = Path(file.filename or "document.pdf").stem
+    # Security: clean up temp files after response is sent
+    background_tasks.add_task(shutil.rmtree, job_dir, True)
     return FileResponse(output_pdf, media_type="application/pdf", filename=f"{safe_stem}_cleaned.pdf")
 
 
@@ -727,17 +733,19 @@ async function submitJob(){
 }
 
 function addRule(data={}){
+  // Security: escape all HTML-significant characters to prevent XSS
+  const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");
   const div=document.createElement("div"); div.className="rule";
   div.innerHTML=`
     <div class="rulehead"><strong>文本规则</strong><button class="danger" type="button">删除</button></div>
     <div class="rulegrid">
-      <input class="r_text" type="text" placeholder="要删除的文本或正则" value="${(data.text||"").replaceAll('"','&quot;')}">
+      <input class="r_text" type="text" placeholder="要删除的文本或正则" value="${esc(data.text||"")}">
       <select class="r_mode">
         <option value="exact">精确</option><option value="contains">包含</option><option value="regex">正则</option>
       </select>
       <label class="switchline"><input class="r_ignore" type="checkbox"> 忽略大小写</label>
     </div>
-    <div class="row"><label>限定页码，空表示全部。例：1,2,14</label><input class="r_pages" type="text" value="${(data.pages||[]).join(",")}"></div>
+    <div class="row"><label>限定页码，空表示全部。例：1,2,14</label><input class="r_pages" type="text" value="${esc((data.pages||[]).join(","))}"></div>
     <label class="switchline"><input class="r_userect" type="checkbox"> 限定坐标区域</label>
     <div class="rect">
       <div><label>x0</label><input class="r_x0" type="number" min="0" max="1" step="0.001" value="0"></div>
