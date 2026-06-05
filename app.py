@@ -4,20 +4,20 @@ import io
 import json
 import os
 import re
+import shutil
+import time
 import uuid
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Literal
-
-import shutil
 
 import cv2
 import fitz  # PyMuPDF
 import numpy as np
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
 
 
@@ -438,6 +438,46 @@ WORKDIR.mkdir(parents=True, exist_ok=True)
 
 # Security: limit upload size to prevent memory-exhaustion DoS
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+# Security: rate limiting configuration
+RATE_LIMIT_WINDOW = 60  # seconds
+RATE_LIMIT_MAX_REQUESTS = 30  # requests per window
+
+
+# Security: simple in-memory rate limiter
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, window: int = RATE_LIMIT_WINDOW, max_requests: int = RATE_LIMIT_MAX_REQUESTS):
+        super().__init__(app)
+        self.window = window
+        self.max_requests = max_requests
+        self.requests: dict[str, list[float]] = defaultdict(list)
+
+    def _get_client_ip(self, request: Request) -> str:
+        return request.client.host if request.client else "unknown"
+
+    def _cleanup_old_requests(self, client_ip: str, now: float):
+        self.requests[client_ip] = [
+            t for t in self.requests[client_ip] if now - t < self.window
+        ]
+
+    async def dispatch(self, request: Request, call_next):
+        # Skip rate limiting for health check
+        if request.url.path == "/health":
+            return await call_next(request)
+
+        client_ip = self._get_client_ip(request)
+        now = time.time()
+
+        self._cleanup_old_requests(client_ip, now)
+
+        if len(self.requests[client_ip]) >= self.max_requests:
+            raise HTTPException(status_code=429, detail="Too many requests. Please try again later.")
+
+        self.requests[client_ip].append(now)
+        return await call_next(request)
+
+
+app.add_middleware(RateLimitMiddleware)
 
 
 # Security: add security headers middleware
