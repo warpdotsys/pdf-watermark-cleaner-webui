@@ -1,0 +1,30 @@
+services:
+  pdf-watermark-cleaner-webui:
+    image: ghcr.io/warpdotsys/pdf-watermark-cleaner-webui:latest
+    container_name: pdf-watermark-cleaner-webui
+    restart: unless-stopped
+    working_dir: /app
+    command:
+      - uvicorn
+      - app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8104:8000"
+    environment:
+      WORKDIR: /data/jobs
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - pdf-watermark-jobs:/data/jobs
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "3"
+
+volumes:
+  pdf-watermark-jobs:
+    external: true

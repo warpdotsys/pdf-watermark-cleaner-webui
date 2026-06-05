@@ -507,6 +507,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Pragma"] = "no-cache"
         # Security: disable DNS prefetch to prevent information leakage
         response.headers["X-DNS-Prefetch-Control"] = "off"
+        # Security: force HTTPS for 1 year (only effective when served over HTTPS)
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
 
 
