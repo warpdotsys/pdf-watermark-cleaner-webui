@@ -496,6 +496,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
         # Security: prevent IE from executing downloads in site context
         response.headers["X-Download-Options"] = "noopen"
+        # Security: prevent search engines from indexing API responses
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
         return response
 
 
