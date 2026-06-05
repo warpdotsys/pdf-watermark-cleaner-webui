@@ -451,16 +451,14 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(SecurityHeadersMiddleware)
 
-# Security: limit upload size to prevent memory-exhaustion DoS
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
-
 
 def _parse_options(options: str) -> ProcessOptions:
     try:
         data = json.loads(options or "{}")
         return ProcessOptions.model_validate(data)
-    except (json.JSONDecodeError, ValidationError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid options JSON: {e}") from e
+    except (json.JSONDecodeError, ValidationError):
+        # Security: don't leak internal validation details to clients
+        raise HTTPException(status_code=400, detail="Invalid options JSON.")
 
 
 async def _save_upload(file: UploadFile, job_dir: Path) -> Path:
