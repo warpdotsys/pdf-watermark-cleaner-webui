@@ -492,6 +492,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'"
         # Security: restrict browser features - this app doesn't need camera, mic, etc.
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
+        # Security: restrict Flash/PDF cross-domain policies
+        response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
         return response
 
 
