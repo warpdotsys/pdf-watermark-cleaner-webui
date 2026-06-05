@@ -490,6 +490,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Security: basic CSP - allow inline styles/scripts for embedded HTML,
         # but restrict resource origins to prevent data exfiltration
         response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'"
+        # Security: restrict browser features - this app doesn't need camera, mic, etc.
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=()"
         return response
 
 
